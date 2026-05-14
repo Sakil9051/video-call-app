@@ -134,24 +134,27 @@ export default function Home() {
 
   // --- WebRTC Logic ---
 
-  const initPeerJS = async (userId: string, stream: MediaStream) => {
-    const { Peer } = await import('peerjs')
-    const peer = new Peer(userId, { debug: 1 })
-    peerRef.current = peer
+  const initPeerJS = (userId: string, stream: MediaStream) => {
+    return new Promise<void>(async (resolve, reject) => {
+      const { Peer } = await import('peerjs')
+      const peer = new Peer(userId, { debug: 1 })
+      peerRef.current = peer
 
-    peer.on('open', () => {
-      console.log('PeerJS connected as:', userId)
-    })
+      peer.on('open', () => {
+        console.log('PeerJS connected as:', userId)
+        resolve()
+      })
 
-    peer.on('call', (incomingCall: any) => {
-      console.log('Incoming call from:', incomingCall.peer)
-      incomingCall.answer(stream)
-      handleCall(incomingCall)
-    })
+      peer.on('call', (incomingCall: any) => {
+        console.log('Incoming call from:', incomingCall.peer)
+        incomingCall.answer(stream)
+        handleCall(incomingCall)
+      })
 
-    peer.on('error', (err: any) => {
-      console.error('Peer error:', err)
-      // PeerJS ID taken or disconnected
+      peer.on('error', (err: any) => {
+        console.error('Peer error:', err)
+        reject(err)
+      })
     })
   }
 
@@ -216,10 +219,19 @@ export default function Home() {
       }))
 
       // Initiate calls to any participants we aren't connected to yet
+      let hasOthers = false
       data.room.participants.forEach((p: any) => {
-        if (p._id !== user.id && !connectionsRef.current[p._id]) {
-          callPeer(p._id, currentStream)
+        if (p._id !== user.id) {
+          hasOthers = true
+          if (!connectionsRef.current[p._id]) {
+            callPeer(p._id, currentStream)
+          }
         }
+      })
+
+      setStatus(prevStatus => {
+        if (!hasOthers && prevStatus !== 'idle') return 'waiting'
+        return prevStatus
       })
       
     } catch (err) {
