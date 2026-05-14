@@ -1,0 +1,30 @@
+{
+  "name": "video-calling-app",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "predev": "node scripts/check-db.js",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cookie": "^1.1.1",
+    "jose": "^6.2.3",
+    "mongoose": "^9.6.2",
+    "next": "14.2.3",
+    "peerjs": "^1.5.2",
+    "react": "^18",
+    "react-dom": "^18"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cookie": "^0.6.0",
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "typescript": "^5"
+  }
+}
