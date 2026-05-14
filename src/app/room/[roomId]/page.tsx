@@ -33,6 +33,9 @@ export default function RoomPage() {
 
   const [remotePeers, setRemotePeers] = useState<{ userId: string; username: string; stream: MediaStream }[]>([])
 
+  // My actual PeerJS peer ID (may have a session suffix if original was taken)
+  const myPeerIdRef = useRef<string>('')
+
   // ---- Auth check ----
   useEffect(() => {
     const cachedUser = sessionStorage.getItem('user')
@@ -99,36 +102,50 @@ export default function RoomPage() {
     }
   }
 
-  const initPeerJS = (userId: string, stream: MediaStream) => {
-    return new Promise<void>(async (resolve, reject) => {
+  const initPeerJS = (userId: string, stream: MediaStream): Promise<string> => {
+    return new Promise(async (resolve, reject) => {
       const { Peer } = await import('peerjs')
-      const peer = new Peer(userId, {
-        debug: 1,
-        config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' },
-          ]
-        }
-      })
-      peerRef.current = peer
 
-      peer.on('open', () => {
-        console.log('[PeerJS] Connected as:', userId)
-        resolve()
-      })
+      const tryConnect = (peerId: string, retries = 3) => {
+        const peer = new Peer(peerId, {
+          debug: 1,
+          config: {
+            iceServers: [
+              { urls: 'stun:stun.l.google.com:19302' },
+              { urls: 'stun:stun1.l.google.com:19302' },
+              { urls: 'stun:global.stun.twilio.com:3478' },
+            ]
+          }
+        })
+        peerRef.current = peer
 
-      peer.on('call', (incomingCall: any) => {
-        console.log('[PeerJS] Incoming call from:', incomingCall.peer)
-        incomingCall.answer(stream)
-        handleCall(incomingCall, stream)
-      })
+        peer.on('open', () => {
+          console.log('[PeerJS] Connected as:', peerId)
+          myPeerIdRef.current = peerId
+          resolve(peerId)
+        })
 
-      peer.on('error', (err: any) => {
-        console.error('[PeerJS] Error:', err)
-        reject(err)
-      })
+        peer.on('call', (incomingCall: any) => {
+          console.log('[PeerJS] Incoming call from:', incomingCall.peer)
+          incomingCall.answer(stream)
+          handleCall(incomingCall, stream)
+        })
+
+        peer.on('error', (err: any) => {
+          if (err.type === 'unavailable-id' && retries > 0) {
+            console.warn('[PeerJS] ID taken, retrying with new ID...')
+            peer.destroy()
+            // Append a short random suffix to make the ID unique
+            const newId = `${userId}_${Math.random().toString(36).slice(2, 6)}`
+            setTimeout(() => tryConnect(newId, retries - 1), 500)
+          } else {
+            console.error('[PeerJS] Fatal error:', err)
+            reject(err)
+          }
+        })
+      }
+
+      tryConnect(userId)
     })
   }
 
@@ -157,9 +174,10 @@ export default function RoomPage() {
     })
   }
 
-  const callPeer = (remoteUserId: string, stream: MediaStream) => {
-    if (!peerRef.current || connectionsRef.current[remoteUserId]) return
-    const call = peerRef.current.call(remoteUserId, stream)
+  const callPeer = (remotePeerId: string, stream: MediaStream) => {
+    if (!peerRef.current || connectionsRef.current[remotePeerId]) return
+    console.log('[PeerJS] Calling peer:', remotePeerId)
+    const call = peerRef.current.call(remotePeerId, stream)
     if (call) handleCall(call, stream)
   }
 
@@ -176,18 +194,24 @@ export default function RoomPage() {
       const data = await res.json()
       setRoomState(data.room)
 
+      // peerIds: { [userId]: peerId }
+      const peerIds: Record<string, string> = data.peerIds || {}
+
       // Sync usernames
       setRemotePeers(prev => prev.map(peer => {
         const p = data.room.participants.find((p: any) => p._id === peer.userId)
         return p ? { ...peer, username: p.username } : peer
       }))
 
-      // Connect to any new participants
+      // Connect to any new participants using their registered peerId
       let hasOthers = false
       data.room.participants.forEach((p: any) => {
         if (p._id !== user.id) {
           hasOthers = true
-          if (!connectionsRef.current[p._id]) callPeer(p._id, stream)
+          const remotePeerId = peerIds[p._id] || p._id
+          if (!connectionsRef.current[remotePeerId]) {
+            callPeer(remotePeerId, stream)
+          }
         }
       })
 
@@ -199,12 +223,28 @@ export default function RoomPage() {
 
   const initCall = async () => {
     try {
-      // Join or create room
-      const joinRes = await fetch(`/api/rooms/${roomId}/join`, { method: 'POST' })
+      const stream = await getMediaStream()
+      localStreamRef.current = stream
+
+      // Attach local video
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream
+      }
+
+      // Connect to PeerJS — get our actual peer ID (may have suffix if original was taken)
+      const myPeerId = await initPeerJS(user.id, stream)
+
+      // Join or create room, sending our peerId so others can call us
+      const joinRes = await fetch(`/api/rooms/${roomId}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ peerId: myPeerId })
+      })
+
       if (!joinRes.ok) {
         const d = await joinRes.json()
-        // Try creating if not found
         if (joinRes.status === 404) {
+          // Room doesn't exist yet — create it
           const createRes = await fetch('/api/rooms', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -214,8 +254,12 @@ export default function RoomPage() {
             const cd = await createRes.json()
             throw new Error(cd.error || 'Failed to create room')
           }
-          const createData = await createRes.json()
-          setRoomState(createData.room)
+          // Save our peerId after creating
+          await fetch(`/api/rooms/${roomId}/join`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ peerId: myPeerId })
+          })
           setStatus('waiting')
         } else {
           throw new Error(d.error || 'Failed to join room')
@@ -223,16 +267,6 @@ export default function RoomPage() {
       } else {
         setStatus('connecting')
       }
-
-      const stream = await getMediaStream()
-      localStreamRef.current = stream
-
-      // Attach local video
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream
-      }
-
-      await initPeerJS(user.id, stream)
 
       // Start polling
       await pollRoomState(stream)

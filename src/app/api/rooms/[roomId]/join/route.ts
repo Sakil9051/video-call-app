@@ -17,6 +17,13 @@ export async function POST(
     await dbConnect()
     const { roomId } = params
 
+    // Read peerId from body if provided
+    let peerId: string | null = null
+    try {
+      const body = await request.json()
+      peerId = body.peerId || null
+    } catch {}
+
     const room = await Room.findOne({ roomId })
     
     if (!room) {
@@ -26,8 +33,14 @@ export async function POST(
     // Add user to participants if not already there
     if (!room.participants.includes(payload.userId)) {
       room.participants.push(payload.userId)
-      await room.save()
     }
+
+    // Store the peerId for this user
+    if (peerId) {
+      room.peerIds.set(String(payload.userId), peerId)
+    }
+
+    await room.save()
 
     return NextResponse.json({ success: true }, { status: 200 })
   } catch (error: any) {

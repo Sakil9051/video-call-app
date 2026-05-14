@@ -18,6 +18,12 @@ const roomSchema = new mongoose.Schema(
         ref: 'User',
       },
     ],
+    // Maps userId -> actual PeerJS peer ID (may differ when re-connecting)
+    peerIds: {
+      type: Map,
+      of: String,
+      default: {},
+    },
   },
   { timestamps: true }
 )

@@ -10,13 +10,18 @@ export async function GET(
     await dbConnect()
     const { roomId } = params
 
-    const room = await Room.findOne({ roomId }).populate('participants', 'username').populate('adminId', 'username')
+    const room = await Room.findOne({ roomId })
+      .populate('participants', 'username')
+      .populate('adminId', 'username')
     
     if (!room) {
       return NextResponse.json({ error: 'Room not found' }, { status: 404 })
     }
 
-    return NextResponse.json({ room }, { status: 200 })
+    // Convert peerIds Map to a plain object for JSON serialization
+    const peerIds = room.peerIds ? Object.fromEntries(room.peerIds) : {}
+
+    return NextResponse.json({ room, peerIds }, { status: 200 })
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
