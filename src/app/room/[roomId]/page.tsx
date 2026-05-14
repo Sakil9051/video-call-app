@@ -81,16 +81,35 @@ export default function RoomPage() {
       setIsAudioEnabled(false)
       return new MediaStream()
     }
+
+    // Optimised constraints: 720p @ 24fps, Opus audio with echo/noise cancellation
+    const videoConstraints = {
+      width:  { ideal: 1280, max: 1280 },
+      height: { ideal: 720,  max: 720  },
+      frameRate: { ideal: 24, max: 30 },
+      facingMode: 'user',
+    }
+    const audioConstraints = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl:  true,
+      sampleRate: 48000,
+      channelCount: 1,  // mono is plenty for calls
+    }
+
     try {
-      return await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      return await navigator.mediaDevices.getUserMedia({
+        video: videoConstraints,
+        audio: audioConstraints,
+      })
     } catch {
       try {
-        const s = await navigator.mediaDevices.getUserMedia({ video: false, audio: true })
+        const s = await navigator.mediaDevices.getUserMedia({ video: false, audio: audioConstraints })
         setIsVideoEnabled(false)
         return s
       } catch {
         try {
-          const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+          const s = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false })
           setIsAudioEnabled(false)
           return s
         } catch {
@@ -99,6 +118,29 @@ export default function RoomPage() {
           return new MediaStream()
         }
       }
+    }
+  }
+
+  // Cap bitrates so the stream stays smooth over poor connections
+  const applyBandwidthCap = async (pc: RTCPeerConnection) => {
+    try {
+      const senders = pc.getSenders()
+      for (const sender of senders) {
+        if (!sender.track) continue
+        const params = sender.getParameters()
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}]
+        }
+        if (sender.track.kind === 'video') {
+          params.encodings[0].maxBitrate = 800_000  // 800 kbps
+          params.encodings[0].scaleResolutionDownBy = 1
+        } else if (sender.track.kind === 'audio') {
+          params.encodings[0].maxBitrate = 64_000   //  64 kbps — plenty for Opus
+        }
+        await sender.setParameters(params)
+      }
+    } catch (e) {
+      console.warn('[BW] Could not apply bandwidth cap:', e)
     }
   }
 
@@ -111,11 +153,16 @@ export default function RoomPage() {
           debug: 1,
           config: {
             iceServers: [
+              // STUN — discovers public IPs
               { urls: 'stun:stun.l.google.com:19302' },
               { urls: 'stun:stun1.l.google.com:19302' },
-              { urls: 'stun:global.stun.twilio.com:3478' },
-            ]
-          }
+              // TURN — relays traffic when direct path fails (cross-network, mobile, strict NAT)
+              { urls: 'turn:openrelay.metered.ca:80',          username: 'openrelayproject', credential: 'openrelayproject' },
+              { urls: 'turn:openrelay.metered.ca:443',         username: 'openrelayproject', credential: 'openrelayproject' },
+              { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+            ],
+            iceCandidatePoolSize: 10,
+          },
         })
         peerRef.current = peer
 
@@ -161,6 +208,11 @@ export default function RoomPage() {
         return [...prev, { userId: remoteUserId, username: 'Loading...', stream: remoteStream }]
       })
       setStatus('connected')
+
+      // Apply bandwidth cap once the underlying RTCPeerConnection is established
+      if (call.peerConnection) {
+        applyBandwidthCap(call.peerConnection)
+      }
     })
 
     call.on('close', () => {
