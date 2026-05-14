@@ -168,9 +168,18 @@ export default function RoomPage() {
           if (err.type === 'unavailable-id' && retries > 0) {
             console.warn('[PeerJS] ID taken, retrying with new ID...')
             peer.destroy()
-            // Append a short random suffix to make the ID unique
             const newId = `${userId}_${Math.random().toString(36).slice(2, 6)}`
             setTimeout(() => tryConnect(newId, retries - 1), 500)
+          } else if (err.type === 'peer-unavailable') {
+            // Remote peer isn't ready yet — extract their ID and clear the dead entry
+            // so the next polling cycle will retry the call
+            const match = String(err.message || '').match(/Could not connect to peer (.+)/)
+            const deadId = match ? match[1].trim() : null
+            if (deadId) {
+              console.warn('[PeerJS] peer-unavailable, will retry:', deadId)
+              delete connectionsRef.current[deadId]
+            }
+            // Don't reject — this is a recoverable error
           } else {
             console.error('[PeerJS] Fatal error:', err)
             reject(err)
@@ -184,29 +193,30 @@ export default function RoomPage() {
 
   const handleCall = (call: any, localStream: MediaStream) => {
     const remoteUserId = call.peer
+    // Guard: don't handle the same peer twice
     if (connectionsRef.current[remoteUserId]) return
+    // Mark as pending immediately so we don't fire a duplicate outgoing call
     connectionsRef.current[remoteUserId] = call
 
     call.on('stream', (remoteStream: MediaStream) => {
-      console.log('[PeerJS] Received stream from:', remoteUserId)
+      console.log('[PeerJS] Stream received from:', remoteUserId)
       setRemotePeers(prev => {
         if (prev.find(p => p.userId === remoteUserId)) return prev
         return [...prev, { userId: remoteUserId, username: 'Loading...', stream: remoteStream }]
       })
       setStatus('connected')
-
-      // Apply bandwidth cap once the underlying RTCPeerConnection is established
-      if (call.peerConnection) {
-        applyBandwidthCap(call.peerConnection)
-      }
+      if (call.peerConnection) applyBandwidthCap(call.peerConnection)
     })
 
     call.on('close', () => {
+      console.log('[PeerJS] Call closed:', remoteUserId)
       delete connectionsRef.current[remoteUserId]
       setRemotePeers(prev => prev.filter(p => p.userId !== remoteUserId))
+      setStatus(prev => prev === 'connected' ? 'waiting' : prev)
     })
 
-    call.on('error', () => {
+    call.on('error', (err: any) => {
+      console.error('[PeerJS] Call error from', remoteUserId, err)
       delete connectionsRef.current[remoteUserId]
       setRemotePeers(prev => prev.filter(p => p.userId !== remoteUserId))
     })
