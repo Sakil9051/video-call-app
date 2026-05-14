@@ -2,9 +2,21 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
+import { io, Socket } from 'socket.io-client'
 import { loadSettings, buildVideoConstraints, buildAudioConstraints } from '@/lib/settings'
 
 type ConnectionStatus = 'idle' | 'waiting' | 'connecting' | 'connected'
+
+const SIGNALING_URL = process.env.NEXT_PUBLIC_SIGNALING_URL || 'http://localhost:3001'
+
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
+  ]
+}
 
 export default function RoomPage() {
   const params = useParams()
@@ -19,23 +31,18 @@ export default function RoomPage() {
   const [status, setStatus] = useState<ConnectionStatus>('idle')
   const [error, setError] = useState<{ title: string; message: string } | null>(null)
   const [isCopied, setIsCopied] = useState(false)
-  const [roomState, setRoomState] = useState<any>(null)
 
   // Media state
   const [isAudioEnabled, setIsAudioEnabled] = useState(true)
   const [isVideoEnabled, setIsVideoEnabled] = useState(true)
 
   // WebRTC refs
-  const peerRef = useRef<any>(null)
+  const socketRef = useRef<Socket | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
   const localVideoRef = useRef<HTMLVideoElement>(null)
-  const connectionsRef = useRef<{ [key: string]: any }>({})
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
-
-  const [remotePeers, setRemotePeers] = useState<{ userId: string; username: string; stream: MediaStream }[]>([])
-
-  // My actual PeerJS peer ID (may have a session suffix if original was taken)
-  const myPeerIdRef = useRef<string>('')
+  const peersRef = useRef<{ [socketId: string]: RTCPeerConnection }>({})
+  
+  const [remotePeers, setRemotePeers] = useState<{ socketId: string; userId: string; username: string; stream: MediaStream | null }[]>([])
 
   // ---- Auth check ----
   useEffect(() => {
@@ -53,7 +60,6 @@ export default function RoomPage() {
         setUser(data.user)
         sessionStorage.setItem('user', JSON.stringify(data.user))
       } else {
-        // Not logged in — redirect to home with roomId pre-filled
         router.replace(`/?join=${roomId}`)
       }
       setIsAuthLoading(false)
@@ -67,22 +73,11 @@ export default function RoomPage() {
     return () => cleanup()
   }, [user, isAuthLoading])
 
-  // ---- On page unload, leave room ----
-  useEffect(() => {
-    const handleUnload = () => {
-      if (roomId) navigator.sendBeacon(`/api/rooms/${roomId}/leave`)
-    }
-    window.addEventListener('beforeunload', handleUnload)
-    return () => window.removeEventListener('beforeunload', handleUnload)
-  }, [roomId])
-
   const getMediaStream = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
-      setIsVideoEnabled(false)
-      setIsAudioEnabled(false)
+      setIsVideoEnabled(false); setIsAudioEnabled(false)
       return new MediaStream()
     }
-
     const s = loadSettings()
     const videoConstraints = buildVideoConstraints(s)
     const audioConstraints = buildAudioConstraints(s)
@@ -95,33 +90,34 @@ export default function RoomPage() {
         setIsVideoEnabled(false)
         return stream
       } catch {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false })
-          setIsAudioEnabled(false)
-          return stream
-        } catch {
-          setIsVideoEnabled(false)
-          setIsAudioEnabled(false)
-          return new MediaStream()
-        }
+        setIsVideoEnabled(false); setIsAudioEnabled(false)
+        return new MediaStream()
       }
     }
   }
 
-  // Cap bitrates based on user settings
+  // Dynamic Bandwidth Cap based on number of users
   const applyBandwidthCap = async (pc: RTCPeerConnection) => {
     try {
       const settings = loadSettings()
+      // If there are many people, lower the bitrate aggressively to prevent lag
+      const numPeers = Object.keys(peersRef.current).length
+      let maxVideo = settings.maxVideoBitrate * 1000
+      let maxAudio = settings.maxAudioBitrate * 1000
+      
+      if (numPeers >= 3) { maxVideo = Math.min(maxVideo, 300_000); maxAudio = 32_000 }
+      else if (numPeers >= 2) { maxVideo = Math.min(maxVideo, 500_000); maxAudio = 48_000 }
+
       const senders = pc.getSenders()
       for (const sender of senders) {
         if (!sender.track) continue
         const params = sender.getParameters()
         if (!params.encodings || params.encodings.length === 0) params.encodings = [{}]
         if (sender.track.kind === 'video') {
-          params.encodings[0].maxBitrate = settings.maxVideoBitrate * 1000
-          params.encodings[0].scaleResolutionDownBy = 1
+          params.encodings[0].maxBitrate = maxVideo
+          params.encodings[0].scaleResolutionDownBy = numPeers >= 3 ? 2 : 1 // Drop resolution if many peers
         } else if (sender.track.kind === 'audio') {
-          params.encodings[0].maxBitrate = settings.maxAudioBitrate * 1000
+          params.encodings[0].maxBitrate = maxAudio
         }
         await sender.setParameters(params)
       }
@@ -130,195 +126,126 @@ export default function RoomPage() {
     }
   }
 
-  const initPeerJS = (userId: string, stream: MediaStream): Promise<string> => {
-    return new Promise(async (resolve, reject) => {
-      const { Peer } = await import('peerjs')
+  const createPeerConnection = (targetSocketId: string, remoteUserId: string, remoteUsername: string) => {
+    const pc = new RTCPeerConnection(ICE_SERVERS)
+    peersRef.current[targetSocketId] = pc
 
-      const tryConnect = (peerId: string, retries = 3) => {
-        const peer = new Peer(peerId, {
-          debug: 1,
-          config: {
-            iceServers: [
-              // STUN — discovers public IPs
-              { urls: 'stun:stun.l.google.com:19302' },
-              { urls: 'stun:stun1.l.google.com:19302' },
-              // TURN — relays traffic when direct path fails (cross-network, mobile, strict NAT)
-              { urls: 'turn:openrelay.metered.ca:80',          username: 'openrelayproject', credential: 'openrelayproject' },
-              { urls: 'turn:openrelay.metered.ca:443',         username: 'openrelayproject', credential: 'openrelayproject' },
-              { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-            ],
-            iceCandidatePoolSize: 10,
-          },
-        })
-        peerRef.current = peer
-
-        peer.on('open', () => {
-          console.log('[PeerJS] Connected as:', peerId)
-          myPeerIdRef.current = peerId
-          resolve(peerId)
-        })
-
-        peer.on('call', (incomingCall: any) => {
-          console.log('[PeerJS] Incoming call from:', incomingCall.peer)
-          incomingCall.answer(stream)
-          handleCall(incomingCall, stream)
-        })
-
-        peer.on('error', (err: any) => {
-          if (err.type === 'unavailable-id' && retries > 0) {
-            console.warn('[PeerJS] ID taken, retrying with new ID...')
-            peer.destroy()
-            const newId = `${userId}_${Math.random().toString(36).slice(2, 6)}`
-            setTimeout(() => tryConnect(newId, retries - 1), 500)
-          } else if (err.type === 'peer-unavailable') {
-            // Remote peer isn't ready yet — extract their ID and clear the dead entry
-            // so the next polling cycle will retry the call
-            const match = String(err.message || '').match(/Could not connect to peer (.+)/)
-            const deadId = match ? match[1].trim() : null
-            if (deadId) {
-              console.warn('[PeerJS] peer-unavailable, will retry:', deadId)
-              delete connectionsRef.current[deadId]
-            }
-            // Don't reject — this is a recoverable error
-          } else {
-            console.error('[PeerJS] Fatal error:', err)
-            reject(err)
-          }
+    pc.onicecandidate = (event) => {
+      if (event.candidate && socketRef.current) {
+        socketRef.current.emit('signal', {
+          targetSocketId,
+          callerId: user.id,
+          callerUsername: user.username,
+          signal: { type: 'candidate', candidate: event.candidate }
         })
       }
+    }
 
-      tryConnect(userId)
-    })
-  }
-
-  const handleCall = (call: any, localStream: MediaStream) => {
-    const remoteUserId = call.peer
-    // Guard: don't handle the same peer twice
-    if (connectionsRef.current[remoteUserId]) return
-    // Mark as pending immediately so we don't fire a duplicate outgoing call
-    connectionsRef.current[remoteUserId] = call
-
-    call.on('stream', (remoteStream: MediaStream) => {
-      console.log('[PeerJS] Stream received from:', remoteUserId)
+    pc.ontrack = (event) => {
       setRemotePeers(prev => {
-        if (prev.find(p => p.userId === remoteUserId)) return prev
-        return [...prev, { userId: remoteUserId, username: 'Loading...', stream: remoteStream }]
+        const existing = prev.find(p => p.socketId === targetSocketId)
+        if (existing && existing.stream) {
+          // If stream already exists, just add track (if needed, though usually ontrack provides the whole stream)
+          return prev
+        }
+        const newPeers = prev.filter(p => p.socketId !== targetSocketId)
+        return [...newPeers, { socketId: targetSocketId, userId: remoteUserId, username: remoteUsername, stream: event.streams[0] }]
       })
       setStatus('connected')
-      if (call.peerConnection) applyBandwidthCap(call.peerConnection)
-    })
-
-    call.on('close', () => {
-      console.log('[PeerJS] Call closed:', remoteUserId)
-      delete connectionsRef.current[remoteUserId]
-      setRemotePeers(prev => prev.filter(p => p.userId !== remoteUserId))
-      setStatus(prev => prev === 'connected' ? 'waiting' : prev)
-    })
-
-    call.on('error', (err: any) => {
-      console.error('[PeerJS] Call error from', remoteUserId, err)
-      delete connectionsRef.current[remoteUserId]
-      setRemotePeers(prev => prev.filter(p => p.userId !== remoteUserId))
-    })
-  }
-
-  const callPeer = (remotePeerId: string, stream: MediaStream) => {
-    if (!peerRef.current || connectionsRef.current[remotePeerId]) return
-    console.log('[PeerJS] Calling peer:', remotePeerId)
-    const call = peerRef.current.call(remotePeerId, stream)
-    if (call) handleCall(call, stream)
-  }
-
-  const pollRoomState = async (stream: MediaStream) => {
-    try {
-      const res = await fetch(`/api/rooms/${roomId}`)
-      if (!res.ok) {
-        if (res.status === 404) {
-          setError({ title: 'Room Closed', message: 'This room no longer exists.' })
-          setTimeout(() => router.replace('/'), 2500)
-        }
-        return
-      }
-      const data = await res.json()
-      setRoomState(data.room)
-
-      // peerIds: { [userId]: peerId }
-      const peerIds: Record<string, string> = data.peerIds || {}
-
-      // Sync usernames
-      setRemotePeers(prev => prev.map(peer => {
-        const p = data.room.participants.find((p: any) => p._id === peer.userId)
-        return p ? { ...peer, username: p.username } : peer
-      }))
-
-      // Connect to any new participants using their registered peerId
-      let hasOthers = false
-      data.room.participants.forEach((p: any) => {
-        if (p._id !== user.id) {
-          hasOthers = true
-          const remotePeerId = peerIds[p._id] || p._id
-          if (!connectionsRef.current[remotePeerId]) {
-            callPeer(remotePeerId, stream)
-          }
-        }
-      })
-
-      if (!hasOthers) setStatus(prev => prev !== 'idle' ? 'waiting' : prev)
-    } catch (err) {
-      console.error('Poll error:', err)
     }
+
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+        removePeer(targetSocketId)
+      }
+    }
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, localStreamRef.current!)
+      })
+    }
+
+    return pc
+  }
+
+  const removePeer = (socketId: string) => {
+    if (peersRef.current[socketId]) {
+      peersRef.current[socketId].close()
+      delete peersRef.current[socketId]
+    }
+    setRemotePeers(prev => prev.filter(p => p.socketId !== socketId))
+    if (Object.keys(peersRef.current).length === 0) setStatus('waiting')
   }
 
   const initCall = async () => {
     try {
+      setStatus('connecting')
       const stream = await getMediaStream()
       localStreamRef.current = stream
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream
 
-      // Attach local video
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream
-      }
+      // 1. Connect to Socket
+      const socket = io(SIGNALING_URL)
+      socketRef.current = socket
 
-      // Connect to PeerJS — get our actual peer ID (may have suffix if original was taken)
-      const myPeerId = await initPeerJS(user.id, stream)
-
-      // Join or create room, sending our peerId so others can call us
-      const joinRes = await fetch(`/api/rooms/${roomId}/join`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ peerId: myPeerId })
+      socket.on('connect', () => {
+        socket.emit('join-room', { roomId, userId: user.id, username: user.username })
+        setStatus('waiting')
       })
 
-      if (!joinRes.ok) {
-        const d = await joinRes.json()
-        if (joinRes.status === 404) {
-          // Room doesn't exist yet — create it
-          const createRes = await fetch('/api/rooms', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ roomId })
+      // 2. Receive users already in room -> Initiate calls to them
+      socket.on('room-users', async (users: any[]) => {
+        if (users.length > 0) setStatus('connecting')
+        for (const u of users) {
+          const pc = createPeerConnection(u.socketId, u.userId, u.username)
+          await applyBandwidthCap(pc)
+          const offer = await pc.createOffer()
+          await pc.setLocalDescription(offer)
+          socket.emit('signal', {
+            targetSocketId: u.socketId,
+            callerId: user.id,
+            callerUsername: user.username,
+            signal: { type: 'offer', sdp: offer }
           })
-          if (!createRes.ok) {
-            const cd = await createRes.json()
-            throw new Error(cd.error || 'Failed to create room')
-          }
-          // Save our peerId after creating
-          await fetch(`/api/rooms/${roomId}/join`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ peerId: myPeerId })
-          })
-          setStatus('waiting')
-        } else {
-          throw new Error(d.error || 'Failed to join room')
         }
-      } else {
-        setStatus('connecting')
-      }
+      })
 
-      // Start polling
-      await pollRoomState(stream)
-      pollIntervalRef.current = setInterval(() => pollRoomState(stream), 3000)
+      // 3. New user joined -> Wait for their offer, but add placeholder
+      socket.on('user-joined', (u: any) => {
+        setRemotePeers(prev => [...prev, { socketId: u.socketId, userId: u.userId, username: u.username, stream: null }])
+      })
+
+      // 4. Handle incoming signals
+      socket.on('signal', async (data: any) => {
+        const { senderSocketId, senderUserId, senderUsername, signal } = data
+        let pc = peersRef.current[senderSocketId]
+
+        if (signal.type === 'offer') {
+          if (!pc) pc = createPeerConnection(senderSocketId, senderUserId, senderUsername)
+          await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
+          await applyBandwidthCap(pc)
+          const answer = await pc.createAnswer()
+          await pc.setLocalDescription(answer)
+          socket.emit('signal', {
+            targetSocketId: senderSocketId,
+            callerId: user.id,
+            callerUsername: user.username,
+            signal: { type: 'answer', sdp: answer }
+          })
+        } else if (signal.type === 'answer') {
+          if (pc) await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
+        } else if (signal.type === 'candidate') {
+          if (pc && pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate(signal.candidate)).catch(() => {})
+          }
+        }
+      })
+
+      // 5. User left
+      socket.on('user-left', (u: any) => {
+        removePeer(u.socketId)
+      })
 
     } catch (err: any) {
       setError({ title: 'Error', message: err.message })
@@ -326,15 +253,13 @@ export default function RoomPage() {
   }
 
   const cleanup = () => {
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
-    Object.values(connectionsRef.current).forEach((call: any) => call.close())
-    connectionsRef.current = {}
-    if (peerRef.current) peerRef.current.destroy()
+    Object.values(peersRef.current).forEach(pc => pc.close())
+    peersRef.current = {}
+    if (socketRef.current) socketRef.current.disconnect()
     if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop())
-    fetch(`/api/rooms/${roomId}/leave`, { method: 'POST' }).catch(() => {})
   }
 
-  const endCall = async () => {
+  const endCall = () => {
     cleanup()
     router.replace('/')
   }
@@ -358,8 +283,6 @@ export default function RoomPage() {
     })
   }
 
-  const isLocalAdmin = roomState?.adminId?._id === user?.id || roomState?.adminId === user?.id
-
   // ---- Remote video component ----
   const RemoteVideo = ({ peer }: { peer: any }) => {
     const ref = useRef<HTMLVideoElement>(null)
@@ -368,27 +291,19 @@ export default function RoomPage() {
     useEffect(() => {
       if (!ref.current || !peer.stream) return
       ref.current.srcObject = peer.stream
-
       const checkTracks = () => {
         const videoTracks = peer.stream.getVideoTracks()
         setHasVideo(videoTracks.length > 0 && videoTracks[0].enabled && videoTracks[0].readyState === 'live')
       }
-
       checkTracks()
       peer.stream.addEventListener('addtrack', checkTracks)
       peer.stream.addEventListener('removetrack', checkTracks)
-
-      ref.current.onloadedmetadata = () => {
-        setHasVideo(peer.stream.getVideoTracks().length > 0)
-      }
-
+      ref.current.onloadedmetadata = () => setHasVideo(peer.stream.getVideoTracks().length > 0)
       return () => {
         peer.stream.removeEventListener('addtrack', checkTracks)
         peer.stream.removeEventListener('removetrack', checkTracks)
       }
     }, [peer.stream])
-
-    const isAdmin = roomState?.adminId?._id === peer.userId || roomState?.adminId === peer.userId
 
     return (
       <div className="video-container remote connected">
@@ -401,19 +316,13 @@ export default function RoomPage() {
         <video ref={ref} autoPlay playsInline style={{ display: hasVideo ? 'block' : 'none', width: '100%', height: '100%', objectFit: 'cover' }} />
         <div className="video-label">
           <span className="status-dot connected" />
-          {peer.username} {isAdmin ? '(Admin)' : ''}
+          {peer.username}
         </div>
       </div>
     )
   }
 
-  if (isAuthLoading) {
-    return (
-      <div className="container">
-        <div style={{ textAlign: 'center', marginTop: '100px', color: 'white' }}>Loading...</div>
-      </div>
-    )
-  }
+  if (isAuthLoading) return <div className="container"><div style={{ textAlign: 'center', marginTop: '100px', color: 'white' }}>Loading...</div></div>
 
   return (
     <>
@@ -433,7 +342,6 @@ export default function RoomPage() {
           )}
         </header>
 
-        {/* Call Screen */}
         <div className="call-screen active">
           <div className="connection-status">
             <span className={`status-dot ${status}`} />
@@ -446,12 +354,10 @@ export default function RoomPage() {
           </div>
 
           <div className="video-grid" style={{ gridTemplateColumns: remotePeers.length > 0 ? 'repeat(auto-fit, minmax(300px, 1fr))' : '1fr' }}>
-            {/* Remote Peers */}
             {remotePeers.map(peer => (
-              <RemoteVideo key={peer.userId} peer={peer} />
+              <RemoteVideo key={peer.socketId} peer={peer} />
             ))}
 
-            {/* Local Video */}
             <div className="video-container local">
               <div className="video-placeholder" style={{ display: isVideoEnabled ? 'none' : 'flex' }}>
                 <div className="avatar">
@@ -468,7 +374,7 @@ export default function RoomPage() {
               />
               <div className="video-label">
                 <span className="status-dot connected" />
-                You {isLocalAdmin ? '(Admin)' : ''}
+                You
               </div>
             </div>
           </div>
@@ -483,37 +389,23 @@ export default function RoomPage() {
               </div>
               <button className="btn btn-secondary copy-btn" onClick={copyRoomUrl} style={{ flexShrink: 0 }}>
                 {isCopied ? (
-                  <>
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
-                    Copied!
-                  </>
+                  <><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg> Copied!</>
                 ) : (
-                  <>
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
-                    Copy Link
-                  </>
+                  <><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg> Copy Link</>
                 )}
               </button>
             </div>
           </div>
 
           <div className="call-controls">
-            <button
-              className={`control-btn tooltip ${!isAudioEnabled ? 'muted' : ''}`}
-              data-tooltip={isAudioEnabled ? 'Mute' : 'Unmute'}
-              onClick={toggleMic}
-            >
+            <button className={`control-btn tooltip ${!isAudioEnabled ? 'muted' : ''}`} data-tooltip={isAudioEnabled ? 'Mute' : 'Unmute'} onClick={toggleMic}>
               {isAudioEnabled ? (
                 <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
               ) : (
                 <svg viewBox="0 0 24 24"><path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/></svg>
               )}
             </button>
-            <button
-              className={`control-btn tooltip ${!isVideoEnabled ? 'video-off' : ''}`}
-              data-tooltip={isVideoEnabled ? 'Disable Camera' : 'Enable Camera'}
-              onClick={toggleCamera}
-            >
+            <button className={`control-btn tooltip ${!isVideoEnabled ? 'video-off' : ''}`} data-tooltip={isVideoEnabled ? 'Disable Camera' : 'Enable Camera'} onClick={toggleCamera}>
               {isVideoEnabled ? (
                 <svg viewBox="0 0 24 24"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg>
               ) : (
@@ -523,15 +415,6 @@ export default function RoomPage() {
             <button className="control-btn end-call tooltip" data-tooltip="Leave Room" onClick={endCall}>
               <svg viewBox="0 0 24 24"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg>
             </button>
-          </div>
-        </div>
-
-        {/* Error Modal */}
-        <div className={`error-modal ${error ? 'active' : ''}`} onClick={() => setError(null)}>
-          <div className="error-content" onClick={(e) => e.stopPropagation()}>
-            <h3>{error?.title}</h3>
-            <p>{error?.message}</p>
-            <button className="btn btn-primary" onClick={() => setError(null)}>OK</button>
           </div>
         </div>
       </div>

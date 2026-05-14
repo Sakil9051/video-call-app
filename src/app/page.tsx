@@ -1,10 +1,9 @@
+
 'use client'
 
-import { useEffect, useRef, useState, Suspense } from 'react'
+import { useEffect, useState, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
-
-type ConnectionStatus = 'idle' | 'waiting' | 'connecting' | 'connected' | 'disconnected'
 
 function HomeContent() {
   const router = useRouter()
@@ -19,32 +18,8 @@ function HomeContent() {
   const [password, setPassword] = useState('')
 
   // Call state
-  const [isInCall, setIsInCall] = useState(false)
-  const [roomId, setRoomId] = useState('')
   const [joinRoomId, setJoinRoomId] = useState('')
-  const [status, setStatus] = useState<ConnectionStatus>('idle')
   const [error, setError] = useState<{ title: string; message: string } | null>(null)
-  const [isCopied, setIsCopied] = useState(false)
-  
-  // Media state
-  const [isAudioEnabled, setIsAudioEnabled] = useState(true)
-  const [isVideoEnabled, setIsVideoEnabled] = useState(true)
-  
-  // Room state from DB
-  const [roomState, setRoomState] = useState<any>(null)
-  
-  // WebRTC & PeerJS refs
-  const peerRef = useRef<any>(null)
-  const localStreamRef = useRef<MediaStream | null>(null)
-  const localVideoRef = useRef<HTMLVideoElement>(null)
-  
-  // Map of userId -> MediaConnection
-  const connectionsRef = useRef<{ [key: string]: any }>({})
-  // Array of remote streams to render
-  const [remotePeers, setRemotePeers] = useState<{ userId: string; username: string; stream: MediaStream }[]>([])
-  
-  // Polling interval ref
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
   // Auth Functions
   const fetchUser = async () => {
@@ -101,7 +76,6 @@ function HomeContent() {
     await fetch('/api/auth/logout', { method: 'POST' })
     setUser(null)
     sessionStorage.removeItem('user')
-    if (isInCall) endCall()
   }
 
   // Initial Hash / query param check
@@ -121,288 +95,7 @@ function HomeContent() {
     }
   }, [user])
 
-  const generateRoomId = () => {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-    let result = ''
-    for (let i = 0; i < 6; i++) {
-      result += chars.charAt(Math.floor(Math.random() * chars.length))
-    }
-    return result
-  }
-
-  const getMediaStream = async () => {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setIsVideoEnabled(false)
-      setIsAudioEnabled(false)
-      return new MediaStream()
-    }
-    
-    try {
-      return await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-    } catch (err: any) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true })
-        setIsVideoEnabled(false)
-        return stream
-      } catch (err2: any) {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
-          setIsAudioEnabled(false)
-          return stream
-        } catch (err3: any) {
-          setIsVideoEnabled(false)
-          setIsAudioEnabled(false)
-          return new MediaStream()
-        }
-      }
-    }
-  }
-
-  // --- WebRTC Logic ---
-
-  const initPeerJS = (userId: string, stream: MediaStream) => {
-    return new Promise<void>(async (resolve, reject) => {
-      const { Peer } = await import('peerjs')
-      const peer = new Peer(userId, { 
-        debug: 1,
-        config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' }
-          ]
-        }
-      })
-      peerRef.current = peer
-
-      peer.on('open', () => {
-        console.log('PeerJS connected as:', userId)
-        resolve()
-      })
-
-      peer.on('call', (incomingCall: any) => {
-        console.log('Incoming call from:', incomingCall.peer)
-        incomingCall.answer(stream)
-        handleCall(incomingCall)
-      })
-
-      peer.on('error', (err: any) => {
-        console.error('Peer error:', err)
-        reject(err)
-      })
-    })
-  }
-
-  const handleCall = (call: any) => {
-    const remoteUserId = call.peer
-    if (connectionsRef.current[remoteUserId]) return // Already connected
-    
-    connectionsRef.current[remoteUserId] = call
-
-    call.on('stream', (remoteStream: MediaStream) => {
-      console.log('Received stream from:', remoteUserId)
-      setRemotePeers(prev => {
-        // Prevent duplicate streams for same user
-        if (prev.find(p => p.userId === remoteUserId)) return prev
-        return [...prev, { userId: remoteUserId, username: 'Loading...', stream: remoteStream }]
-      })
-      setStatus('connected')
-    })
-
-    call.on('close', () => {
-      console.log('Call closed:', remoteUserId)
-      delete connectionsRef.current[remoteUserId]
-      setRemotePeers(prev => prev.filter(p => p.userId !== remoteUserId))
-    })
-
-    call.on('error', (err: any) => {
-      console.error('Call error:', err)
-      delete connectionsRef.current[remoteUserId]
-      setRemotePeers(prev => prev.filter(p => p.userId !== remoteUserId))
-    })
-  }
-
-  const callPeer = (remoteUserId: string, stream: MediaStream) => {
-    if (!peerRef.current || connectionsRef.current[remoteUserId]) return
-    console.log('Calling peer:', remoteUserId)
-    const call = peerRef.current.call(remoteUserId, stream)
-    if (call) handleCall(call)
-  }
-
-  const pollRoomState = async (roomIdToPoll: string, currentStream: MediaStream) => {
-    try {
-      const res = await fetch(`/api/rooms/${roomIdToPoll}`)
-      if (!res.ok) {
-        if (res.status === 404) {
-           // Room deleted or ended
-           endCall()
-           setError({ title: 'Room Closed', message: 'The room has been closed.' })
-        }
-        return
-      }
-      
-      const data = await res.json()
-      setRoomState(data.room)
-
-      // Sync usernames for existing remote streams
-      setRemotePeers(prev => prev.map(peer => {
-        const participant = data.room.participants.find((p: any) => p._id === peer.userId)
-        if (participant && peer.username !== participant.username) {
-          return { ...peer, username: participant.username }
-        }
-        return peer
-      }))
-
-      // Initiate calls to any participants we aren't connected to yet
-      let hasOthers = false
-      data.room.participants.forEach((p: any) => {
-        if (p._id !== user.id) {
-          hasOthers = true
-          if (!connectionsRef.current[p._id]) {
-            callPeer(p._id, currentStream)
-          }
-        }
-      })
-
-      setStatus(prevStatus => {
-        if (!hasOthers && prevStatus !== 'idle') return 'waiting'
-        return prevStatus
-      })
-      
-    } catch (err) {
-      console.error('Error polling room state:', err)
-    }
-  }
-
-  // --- Room API Interaction ---
-
-  const createRoom = async () => {
-    const newRoomId = generateRoomId()
-    try {
-      const res = await fetch('/api/rooms', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: newRoomId })
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Failed to create room')
-      router.push(`/room/${newRoomId}`)
-    } catch (err: any) {
-      setError({ title: 'Error', message: err.message })
-    }
-  }
-
-  const joinRoom = async () => {
-    const roomIdVal = joinRoomId.toUpperCase().trim()
-    if (!roomIdVal || roomIdVal.length !== 6) {
-      setError({ title: 'Invalid Room ID', message: 'Please enter a valid 6-character room ID.' })
-      return
-    }
-    router.push(`/room/${roomIdVal}`)
-  }
-
-  const endCall = async () => {
-    // Leave room in DB
-    if (roomId) {
-      fetch(`/api/rooms/${roomId}/leave`, { method: 'POST' }).catch(console.error)
-    }
-
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
-
-    Object.values(connectionsRef.current).forEach(call => call.close())
-    connectionsRef.current = {}
-    setRemotePeers([])
-
-    if (peerRef.current) peerRef.current.destroy()
-    if (localStreamRef.current) localStreamRef.current.getTracks().forEach(track => track.stop())
-
-    peerRef.current = null
-    localStreamRef.current = null
-    setRoomId('')
-    setRoomState(null)
-    setStatus('idle')
-    setIsAudioEnabled(true)
-    setIsVideoEnabled(true)
-    history.replaceState(null, '', window.location.pathname)
-    setIsInCall(false)
-  }
-
-  // Handle unload to properly leave room
-  useEffect(() => {
-    const handleUnload = () => {
-      if (roomId && isInCall) {
-        navigator.sendBeacon(`/api/rooms/${roomId}/leave`)
-      }
-    }
-    window.addEventListener('beforeunload', handleUnload)
-    return () => window.removeEventListener('beforeunload', handleUnload)
-  }, [roomId, isInCall])
-
-  // --- Controls ---
-
-  const toggleMic = () => {
-    if (localStreamRef.current) {
-      const audioTrack = localStreamRef.current.getAudioTracks()[0]
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled
-        setIsAudioEnabled(audioTrack.enabled)
-      }
-    }
-  }
-
-  const toggleCamera = () => {
-    if (localStreamRef.current) {
-      const videoTrack = localStreamRef.current.getVideoTracks()[0]
-      if (videoTrack) {
-        videoTrack.enabled = !videoTrack.enabled
-        setIsVideoEnabled(videoTrack.enabled)
-      }
-    }
-  }
-
-  const copyRoomId = () => {
-    if (roomId) {
-      navigator.clipboard.writeText(roomId).then(() => {
-        setIsCopied(true)
-        setTimeout(() => setIsCopied(false), 2000)
-      })
-    }
-  }
-
   const closeError = () => setError(null)
-
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') joinRoom()
-  }
-
-  // --- Video Component for Remote Peers ---
-  const RemoteVideo = ({ peer }: { peer: any }) => {
-    const ref = useRef<HTMLVideoElement>(null)
-    const [hasVideo, setHasVideo] = useState(true)
-
-    useEffect(() => {
-      if (ref.current) ref.current.srcObject = peer.stream
-      setHasVideo(peer.stream && peer.stream.getVideoTracks().length > 0)
-    }, [peer.stream])
-
-    // Check if this peer is the admin
-    const isAdmin = roomState?.adminId?._id === peer.userId || roomState?.adminId === peer.userId
-
-    return (
-      <div className="video-container remote connected">
-        <div className="video-placeholder" style={{ display: hasVideo ? 'none' : 'flex' }}>
-          <div className="avatar">
-            <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
-          </div>
-          <span className="name">{peer.username}</span>
-        </div>
-        <video ref={ref} autoPlay playsInline style={{ display: hasVideo ? 'block' : 'none' }} />
-        <div className="video-label">
-          <span className="status-dot connected" />
-          {peer.username} {isAdmin ? '(Admin)' : ''}
-        </div>
-      </div>
-    )
-  }
 
   if (isAuthLoading) {
     return (
@@ -411,9 +104,6 @@ function HomeContent() {
       </div>
     )
   }
-
-  // Check if current user is admin
-  const isLocalAdmin = roomState?.adminId?._id === user?.id || roomState?.adminId === user?.id
 
   return (
     <>
@@ -441,7 +131,7 @@ function HomeContent() {
           )}
         </header>
 
-        {!user ? (
+        {(!user || (!showAuth && user)) ? (
           !showAuth ? (
             <div className="landing-page-scroll">
             <div className="hero-section">
@@ -449,7 +139,11 @@ function HomeContent() {
                 <h2>Connect Instantly with<br/><span className="highlight">Anyone, Anywhere.</span></h2>
                 <p>PeerConnect is a blazing fast, peer-to-peer video calling platform. Create a room instantly, share the code, and start talking securely in high definition without any downloads.</p>
                 <div className="hero-actions">
-                  <button className="btn btn-primary btn-large" onClick={() => setShowAuth(true)}>Get Started for Free</button>
+                  {user ? (
+                    <button className="btn btn-primary btn-large" onClick={() => router.push('/dashboard')}>Go to Dashboard</button>
+                  ) : (
+                    <button className="btn btn-primary btn-large" onClick={() => setShowAuth(true)}>Get Started for Free</button>
+                  )}
                 </div>
                 <div className="hero-features">
                   <div className="feature">
@@ -606,130 +300,7 @@ function HomeContent() {
             </div>
           </div>
           )
-        ) : (
-          <>
-            {/* Welcome Screen */}
-            <div className={`welcome-screen ${isInCall ? 'hidden' : ''}`}>
-              <div className="welcome-content">
-                <h2>Start a Video Call</h2>
-                <p>Create a room and share the link, or join an existing room.</p>
-              </div>
-
-              <div className="action-cards">
-                <div className="action-card" onClick={createRoom}>
-                  <div className="icon">
-                    <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
-                  </div>
-                  <h3>Create Room</h3>
-                  <p>Generate a new room and wait for someone to join</p>
-                </div>
-
-                <div className="action-card">
-                  <div className="icon">
-                    <svg viewBox="0 0 24 24"><path d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-9-2V7H4v3H1v2h3v3h2v-3h3v-2H6zm9 4c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
-                  </div>
-                  <h3>Join Room</h3>
-                  <p>Enter a room ID to join an existing call</p>
-                  <div className="join-form">
-                    <input
-                      type="text"
-                      value={joinRoomId}
-                      onChange={(e) => setJoinRoomId(e.target.value.toUpperCase())}
-                      placeholder="Enter room ID"
-                      maxLength={6}
-                      onKeyPress={handleKeyPress}
-                    />
-                    <button className="btn btn-primary" onClick={joinRoom}>Join</button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Call Screen */}
-            <div className={`call-screen ${isInCall ? 'active' : ''}`}>
-              <div className="connection-status">
-                <span className={`status-dot ${status}`} />
-                <span>
-                  {status === 'waiting' && 'Waiting for others to join...'}
-                  {status === 'connecting' && 'Connecting...'}
-                  {status === 'connected' && `Connected (${remotePeers.length + 1} participants)`}
-                  {status === 'idle' && 'Connecting...'}
-                </span>
-              </div>
-
-              <div className="video-grid" style={{ gridTemplateColumns: remotePeers.length > 0 ? 'repeat(auto-fit, minmax(300px, 1fr))' : '1fr' }}>
-                
-                {/* Remote Peers */}
-                {remotePeers.map(peer => (
-                  <RemoteVideo key={peer.userId} peer={peer} />
-                ))}
-
-                {/* Local Video */}
-                <div className="video-container local">
-                  <div className="video-placeholder" style={{ display: isVideoEnabled ? 'none' : 'flex' }}>
-                    <div className="avatar">
-                      <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
-                    </div>
-                    <span className="name">{user?.username} (You)</span>
-                  </div>
-                  <video ref={localVideoRef} autoPlay playsInline muted style={{ display: isVideoEnabled ? 'block' : 'none' }} />
-                  <div className="video-label">
-                    <span className="status-dot connected" />
-                    You {isLocalAdmin ? '(Admin)' : ''}
-                  </div>
-                </div>
-              </div>
-
-              <div className="room-panel" style={{ display: 'flex' }}>
-                <div className="room-info">
-                  <div className="room-label">Room ID</div>
-                  <div className="room-id">{roomId}</div>
-                </div>
-                <button className="btn btn-secondary copy-btn" onClick={copyRoomId}>
-                  {isCopied ? (
-                    <>
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
-                      Copied!
-                    </>
-                  ) : (
-                    <>
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
-                      Copy
-                    </>
-                  )}
-                </button>
-              </div>
-
-              <div className="call-controls">
-                <button
-                  className={`control-btn tooltip ${!isAudioEnabled ? 'muted' : ''}`}
-                  data-tooltip={isAudioEnabled ? 'Mute' : 'Unmute'}
-                  onClick={toggleMic}
-                >
-                  {isAudioEnabled ? (
-                    <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
-                  ) : (
-                    <svg viewBox="0 0 24 24"><path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/></svg>
-                  )}
-                </button>
-                <button
-                  className={`control-btn tooltip ${!isVideoEnabled ? 'video-off' : ''}`}
-                  data-tooltip={isVideoEnabled ? 'Disable Camera' : 'Enable Camera'}
-                  onClick={toggleCamera}
-                >
-                  {isVideoEnabled ? (
-                    <svg viewBox="0 0 24 24"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/></svg>
-                  ) : (
-                    <svg viewBox="0 0 24 24"><path d="M21 6.5l-4 4V7c0-.55-.45-1-1-1H9.82L21 17.18V6.5zM3.27 2L2 3.27 4.73 6H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.21 0 .39-.08.54-.18L19.73 21 21 19.73 3.27 2z"/></svg>
-                  )}
-                </button>
-                <button className="control-btn end-call tooltip" data-tooltip="Leave Room" onClick={endCall}>
-                  <svg viewBox="0 0 24 24"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg>
-                </button>
-              </div>
-            </div>
-          </>
-        )}
+        ) : null}
 
         {/* Error Modal */}
         <div className={`error-modal ${error ? 'active' : ''}`} onClick={closeError}>
