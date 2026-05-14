@@ -18,10 +18,11 @@ export async function GET(
       return NextResponse.json({ error: 'Room not found' }, { status: 404 })
     }
 
-    // Convert peerIds Map to a plain object for JSON serialization
-    const peerIds = room.peerIds ? Object.fromEntries(room.peerIds) : {}
+    // Use toObject() so Mongoose Maps serialize correctly to plain objects
+    const roomObj = room.toObject()
+    const peerIds: Record<string, string> = roomObj.peerIds || {}
 
-    return NextResponse.json({ room, peerIds }, { status: 200 })
+    return NextResponse.json({ room: roomObj, peerIds }, { status: 200 })
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
