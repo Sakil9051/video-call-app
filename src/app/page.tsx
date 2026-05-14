@@ -1,10 +1,14 @@
 'use client'
 
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, Suspense } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 
 type ConnectionStatus = 'idle' | 'waiting' | 'connecting' | 'connected' | 'disconnected'
 
-export default function Home() {
+function HomeContent() {
+  const router = useRouter()
+  const searchParams = useSearchParams()
+
   // Auth state
   const [user, setUser] = useState<any>(null)
   const [isAuthLoading, setIsAuthLoading] = useState(true)
@@ -99,13 +103,22 @@ export default function Home() {
     if (isInCall) endCall()
   }
 
-  // Initial Hash check
+  // Initial Hash / query param check
   useEffect(() => {
+    const joinParam = searchParams.get('join')
+    if (joinParam && joinParam.length === 6) {
+      setJoinRoomId(joinParam.toUpperCase())
+      if (user) {
+        router.push(`/room/${joinParam.toUpperCase()}`)
+      } else {
+        setShowAuth(true)
+      }
+    }
     const hash = window.location.hash.slice(1)
     if (hash && hash.length === 6) {
-      setJoinRoomId(hash)
+      setJoinRoomId(hash.toUpperCase())
     }
-  }, [])
+  }, [user])
 
   const generateRoomId = () => {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -263,9 +276,7 @@ export default function Home() {
 
   const createRoom = async () => {
     const newRoomId = generateRoomId()
-    
     try {
-      // Create room in DB
       const res = await fetch('/api/rooms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -273,25 +284,7 @@ export default function Home() {
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Failed to create room')
-
-      setRoomId(newRoomId)
-      setRoomState(data.room)
-      setStatus('waiting')
-
-      const stream = await getMediaStream()
-      localStreamRef.current = stream
-
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream
-      }
-
-      await initPeerJS(user.id, stream)
-      setIsInCall(true)
-      window.location.hash = newRoomId
-
-      // Start polling
-      pollIntervalRef.current = setInterval(() => pollRoomState(newRoomId, stream), 3000)
-
+      router.push(`/room/${newRoomId}`)
     } catch (err: any) {
       setError({ title: 'Error', message: err.message })
     }
@@ -303,34 +296,7 @@ export default function Home() {
       setError({ title: 'Invalid Room ID', message: 'Please enter a valid 6-character room ID.' })
       return
     }
-
-    try {
-      // Join room in DB
-      const res = await fetch(`/api/rooms/${roomIdVal}/join`, { method: 'POST' })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Failed to join room')
-
-      setRoomId(roomIdVal)
-      setStatus('connecting')
-
-      const stream = await getMediaStream()
-      localStreamRef.current = stream
-
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream
-      }
-
-      await initPeerJS(user.id, stream)
-      setIsInCall(true)
-      window.location.hash = roomIdVal
-
-      // Start polling and fetch immediate state
-      pollRoomState(roomIdVal, stream)
-      pollIntervalRef.current = setInterval(() => pollRoomState(roomIdVal, stream), 3000)
-
-    } catch (err: any) {
-      setError({ title: 'Error', message: err.message })
-    }
+    router.push(`/room/${roomIdVal}`)
   }
 
   const endCall = async () => {
@@ -767,5 +733,13 @@ export default function Home() {
         </div>
       </div>
     </>
+  )
+}
+
+export default function Home() {
+  return (
+    <Suspense fallback={<div className="container"><div style={{ textAlign: 'center', marginTop: '100px', color: 'white' }}>Loading...</div></div>}>
+      <HomeContent />
+    </Suspense>
   )
 }
