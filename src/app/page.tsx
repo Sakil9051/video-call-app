@@ -48,8 +48,10 @@ export default function Home() {
       if (res.ok) {
         const data = await res.json()
         setUser(data.user)
+        sessionStorage.setItem('user', JSON.stringify(data.user))
       } else {
         setUser(null)
+        sessionStorage.removeItem('user')
       }
     } catch (e) {
       setUser(null)
@@ -59,6 +61,14 @@ export default function Home() {
   }
 
   useEffect(() => {
+    const cachedUser = sessionStorage.getItem('user')
+    if (cachedUser) {
+      try {
+        setUser(JSON.parse(cachedUser))
+        setIsAuthLoading(false)
+        return // Skip network request if user is in sessionStorage
+      } catch (e) {}
+    }
     fetchUser()
   }, [])
 
@@ -74,6 +84,7 @@ export default function Home() {
       if (!res.ok) throw new Error(data.error || 'Authentication failed')
       
       setUser(data.user)
+      sessionStorage.setItem('user', JSON.stringify(data.user))
       setUsername('')
       setPassword('')
     } catch (err: any) {
@@ -84,6 +95,7 @@ export default function Home() {
   const handleLogout = async () => {
     await fetch('/api/auth/logout', { method: 'POST' })
     setUser(null)
+    sessionStorage.removeItem('user')
     if (isInCall) endCall()
   }
 
@@ -137,7 +149,15 @@ export default function Home() {
   const initPeerJS = (userId: string, stream: MediaStream) => {
     return new Promise<void>(async (resolve, reject) => {
       const { Peer } = await import('peerjs')
-      const peer = new Peer(userId, { debug: 1 })
+      const peer = new Peer(userId, { 
+        debug: 1,
+        config: {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:global.stun.twilio.com:3478' }
+          ]
+        }
+      })
       peerRef.current = peer
 
       peer.on('open', () => {
@@ -390,8 +410,11 @@ export default function Home() {
   // --- Video Component for Remote Peers ---
   const RemoteVideo = ({ peer }: { peer: any }) => {
     const ref = useRef<HTMLVideoElement>(null)
+    const [hasVideo, setHasVideo] = useState(true)
+
     useEffect(() => {
       if (ref.current) ref.current.srcObject = peer.stream
+      setHasVideo(peer.stream && peer.stream.getVideoTracks().length > 0)
     }, [peer.stream])
 
     // Check if this peer is the admin
@@ -399,7 +422,13 @@ export default function Home() {
 
     return (
       <div className="video-container remote connected">
-        <video ref={ref} autoPlay playsInline />
+        <div className="video-placeholder" style={{ display: hasVideo ? 'none' : 'flex' }}>
+          <div className="avatar">
+            <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+          </div>
+          <span className="name">{peer.username}</span>
+        </div>
+        <video ref={ref} autoPlay playsInline style={{ display: hasVideo ? 'block' : 'none' }} />
         <div className="video-label">
           <span className="status-dot connected" />
           {peer.username} {isAdmin ? '(Admin)' : ''}
