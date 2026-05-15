@@ -1,0 +1,16 @@
+{
+  "name": "signaling-server",
+  "version": "1.0.0",
+  "description": "Custom Socket.io signaling server for PeerConnect",
+  "main": "server.js",
+  "scripts": {
+    "prestart": "node kill-port.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "mediasoup": "^3.14.3"
+  }
+}
