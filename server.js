@@ -88,10 +88,21 @@ io.on('connection', (socket) => {
     const isAdmitted = room.admittedUserIds.has(userId);
 
     if (!isAdmitted) {
+      // Check if this USER is already waiting (perhaps from a previous tab or auto-join check)
+      const existingWaitingSocketId = Array.from(room.waitingParticipants.entries())
+        .find(([_, p]) => p.userId === userId)?.[0];
+
+      if (existingWaitingSocketId) {
+        room.waitingParticipants.delete(existingWaitingSocketId);
+      }
+
       room.waitingParticipants.set(socket.id, { userId, username });
       console.log(`[Room ${roomId}] User ${username} is waiting...`);
       
-      io.to(room.adminSocketId).emit('user-waiting', { socketId: socket.id, userId, username });
+      // Only notify the admin if they weren't already in the list
+      if (!existingWaitingSocketId) {
+        io.to(room.adminSocketId).emit('user-waiting', { socketId: socket.id, userId, username });
+      }
       
       return callback({ 
         rtpCapabilities: room.router.rtpCapabilities,
