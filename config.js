@@ -44,12 +44,13 @@ module.exports = {
       listenIps: [
         {
           ip: '0.0.0.0',
-          announcedIp: '127.0.0.1', // REPLACE with your public IP for production
+          announcedIp: process.env.ANNOUNCED_IP || undefined, // Set this in Render env vars if you have a public IP
         },
       ],
-      enableUdp: true,
+      enableUdp: process.env.NODE_ENV === 'production' ? false : true, // UDP is blocked on Render Web Services
       enableTcp: true,
-      preferUdp: true,
+      preferUdp: process.env.NODE_ENV === 'production' ? false : true,
+      preferTcp: process.env.NODE_ENV === 'production' ? true : false,
     },
   },
 };

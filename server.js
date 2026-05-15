@@ -404,7 +404,7 @@ app.get('/', (req, res) => {
   res.send('PeerConnect Mediasoup SFU is running.');
 });
 
-const PORT = config.listenPort || 3001;
+const PORT = process.env.PORT || 3001;
 createWorkers().then(() => {
   server.listen(PORT, () => {
     console.log(`Mediasoup SFU running on port ${PORT}`);
