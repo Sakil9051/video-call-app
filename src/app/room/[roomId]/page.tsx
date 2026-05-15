@@ -492,7 +492,11 @@ export default function RoomPage() {
 
       socket.off('user-waiting')
       socket.on('user-waiting', (user: any) => {
-        setWaitingUsers(prev => [...prev.filter(u => u.socketId !== user.socketId), user])
+        setWaitingUsers(prev => {
+          // Remove any existing entry for this USER ID or socket ID
+          const filtered = prev.filter(u => u.userId !== user.userId && u.socketId !== user.socketId)
+          return [...filtered, user]
+        })
       })
 
       socket.off('waiting-user-left')
